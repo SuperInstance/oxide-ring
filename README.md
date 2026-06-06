@@ -1,92 +1,71 @@
 # oxide-ring
 
-Ring buffer for GPU event logging with ternary overflow state. {+1=normal, 0=near_full, -1=overflowed}. Lossless until overflow, then oldest dropped.
+*Ring buffer for GPU event logging with ternary overflow state. Events flow in, old events flow out — but you always know whether what you lost mattered.*
 
-## Why This Matters
+## Why This Exists
 
-# oxide-ring
-Ring buffer for GPU event logging with ternary overflow state.
+GPU event logging has a unique constraint: you can't pause the pipeline to flush. Kernels run asynchronously, events arrive faster than you can read them, and the only sane data structure is a ring buffer — old events get overwritten by new ones. But "overwritten" isn't the end of the story. Sometimes the lost events were noise. Sometimes they were critical. The ternary overflow state distinguishes between three outcomes:
 
-## The Five-Layer Stack
+- **+1 (Aggregated):** Overflow was productive — events were merged into summaries
+- **0 (Clean):** No overflow — every event was preserved
+- **-1 (Lost):** Events were dropped without processing
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+## Architecture
 
 ```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
+Write Pointer ──→ [E₁][E₂][E₃][E₄][E₅][E₆][E₇][E₈] ──→ Read Pointer
+                   ↑                                      ↑
+               Oldest (overwritten first)            Newest
+
+Overflow State Machine:
+  Clean (0) ──buffer full──→ Lost (-1) ──enable aggregation──→ Aggregated (+1)
+  Aggregated (+1) ──reader catches up──→ Clean (0)
 ```
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### Key Types
 
-## Design
-
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
-
-```rust
-pub enum BufferState
-pub struct Event
-pub struct OxideRing
-pub fn new
-pub fn write
-pub fn read
-pub fn peek
-pub fn state
-pub fn drain
-pub fn query_by_kind
-pub fn len
-pub fn is_empty
-```
+- **`RingBuffer<T>`** — Bounded ring buffer with ternary overflow tracking. Generic over event type. Push overwrites oldest when full.
+- **`RingReader<T>`** — Cursor-based reader that tracks how far behind it is. Reports lag in events.
+- **`OverflowState`** — Enum: Lost / Clean / Aggregated. Updated automatically on push.
+- **`RingStats`** — Total pushes, total reads, overflow count, current lag.
 
 ## Usage
 
-```toml
-[dependencies]
-oxide-ring = "0.1.0"
-```
-
 ```rust
 use oxide_ring::*;
-// See src/lib.rs tests for complete working examples
+
+// Create a 1024-event ring buffer
+let mut ring: RingBuffer<u64> = RingBuffer::new(1024);
+
+// Push events (from GPU kernel callbacks)
+for i in 0..2000 {
+    ring.push(i); // Overwrites oldest after 1024
+}
+
+// Check overflow state
+match ring.overflow_state() {
+    OverflowState::Lost => println!("Events were dropped!"),
+    OverflowState::Clean => println!("All events preserved"),
+    OverflowState::Aggregated => println!("Events merged into summaries"),
+}
+
+// Read with a cursor
+let mut reader = ring.reader();
+while let Some(event) = reader.next() {
+    process(event);
+}
+println!("Reader lag: {} events", reader.lag());
 ```
 
-## Testing
+## The Deeper Idea
 
-```bash
-git clone https://github.com/SuperInstance/oxide-ring.git
-cd oxide-ring
-cargo test    # 8 tests
-```
+Ring buffers are the simplest possible streaming data structure. On the GPU, they're also the most practical — a kernel can write events to a ring buffer with a single atomic increment of the write pointer, no synchronization needed. The ternary overflow state adds metadata without adding latency.
 
-## Stats
+This pattern appears everywhere in the SuperInstance ecosystem: `ternary-walsh` (streaming Walsh transforms), `oxide-journal` (WAL with similar overflow semantics), and `agent-transcription` (streaming event capture).
 
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Rust | 148 |
-| Public API | 16 items |
+## Related Crates
 
-## License
-
-Apache-2.0
+- `oxide-journal` — Write-ahead log (durable version of ring semantics)
+- `oxide-chunk` — Memory chunk management for ring buffer backing storage
+- `oxide-sandbox` — Safe execution environment that uses rings for event capture
+- `agent-transcription` — Agent event streaming using the same overflow model
