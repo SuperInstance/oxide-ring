@@ -1,71 +1,107 @@
-# oxide-ring
+# Oxide Ring
 
-*Ring buffer for GPU event logging with ternary overflow state. Events flow in, old events flow out — but you always know whether what you lost mattered.*
+**Oxide Ring** is a GPU event ring buffer with ternary overflow state — `+1` (normal), `0` (near full at 80% capacity), `-1` (overflowed, dropping oldest) — providing bounded-memory event logging for GPU kernel diagnostics.
 
-## Why This Exists
+## Why It Matters
 
-GPU event logging has a unique constraint: you can't pause the pipeline to flush. Kernels run asynchronously, events arrive faster than you can read them, and the only sane data structure is a ring buffer — old events get overwritten by new ones. But "overwritten" isn't the end of the story. Sometimes the lost events were noise. Sometimes they were critical. The ternary overflow state distinguishes between three outcomes:
+GPU kernels emit millions of events per second — profiling data, error markers, memory transfers. An unbounded log causes GPU OOM; a fixed-size circular buffer loses old data silently. Oxide Ring provides the middle ground: a bounded ring buffer that signals its state via ternary overflow flags. At 80% capacity, it enters `NearFull` (0), giving consumers a warning to drain. Once full, it enters `Overflowed` (-1) and drops the oldest events, tracking total dropped count for health monitoring.
 
-- **+1 (Aggregated):** Overflow was productive — events were merged into summaries
-- **0 (Clean):** No overflow — every event was preserved
-- **-1 (Lost):** Events were dropped without processing
+## How It Works
 
-## Architecture
+### Ring Buffer Mechanics
+
+The ring uses a `VecDeque<Event>` with fixed capacity:
 
 ```
-Write Pointer ──→ [E₁][E₂][E₃][E₄][E₅][E₆][E₇][E₈] ──→ Read Pointer
-                   ↑                                      ↑
-               Oldest (overwritten first)            Newest
-
-Overflow State Machine:
-  Clean (0) ──buffer full──→ Lost (-1) ──enable aggregation──→ Aggregated (+1)
-  Aggregated (+1) ──reader catches up──→ Clean (0)
+write(event):
+  if buffer.len() >= capacity:
+    buffer.pop_front()    // drop oldest
+    dropped += 1
+  buffer.push_back(event)
+  total_written += 1
 ```
 
-### Key Types
+Write cost: **O(1)** amortized (VecDeque push_back). Pop front: **O(1)**.
 
-- **`RingBuffer<T>`** — Bounded ring buffer with ternary overflow tracking. Generic over event type. Push overwrites oldest when full.
-- **`RingReader<T>`** — Cursor-based reader that tracks how far behind it is. Reports lag in events.
-- **`OverflowState`** — Enum: Lost / Clean / Aggregated. Updated automatically on push.
-- **`RingStats`** — Total pushes, total reads, overflow count, current lag.
+### Ternary State Computation
 
-## Usage
+```
+fill_ratio = buffer.len() / capacity
+
+if fill_ratio < warn_threshold (0.8):  → Normal (+1)
+if warn_threshold ≤ fill_ratio < 1.0:  → NearFull (0)
+if dropped > 0 (overflow occurred):     → Overflowed (-1)
+```
+
+The `warn_threshold` is configurable (default 0.8). State computation: **O(1)**.
+
+### Event Structure
+
+Each event contains:
+- `id: u64` — monotonically increasing sequence number
+- `kind: String` — event type tag (e.g., "kernel_launch", "memcpy")
+- `data: Vec<u8>` — opaque payload
+- `timestamp_us: u64` — microsecond timestamp
+
+### Sequential Read
+
+Consumers read events sequentially:
+
+```
+read_all() → Vec<&Event>    // O(N) where N = current buffer size
+read_since(last_id) → Vec<&Event>    // O(N) with binary search for last_id
+```
+
+The `id` field enables gap detection — if a consumer sees IDs 1,2,5,6, it knows events 3,4 were dropped due to overflow.
+
+### Statistics
+
+```
+total_written: u64   // lifetime write count
+dropped: u64         // lifetime drop count
+fill_ratio: f64      // current buffer utilization
+```
+
+All **O(1)** to compute from tracked counters.
+
+## Quick Start
 
 ```rust
-use oxide_ring::*;
+use oxide_ring::{OxideRing, BufferState};
 
-// Create a 1024-event ring buffer
-let mut ring: RingBuffer<u64> = RingBuffer::new(1024);
+let mut ring = OxideRing::new(1024); // 1024-event capacity
 
-// Push events (from GPU kernel callbacks)
 for i in 0..2000 {
-    ring.push(i); // Overwrites oldest after 1024
+    ring.write("kernel_done", &[i as u8], i * 1000);
 }
 
-// Check overflow state
-match ring.overflow_state() {
-    OverflowState::Lost => println!("Events were dropped!"),
-    OverflowState::Clean => println!("All events preserved"),
-    OverflowState::Aggregated => println!("Events merged into summaries"),
-}
-
-// Read with a cursor
-let mut reader = ring.reader();
-while let Some(event) = reader.next() {
-    process(event);
-}
-println!("Reader lag: {} events", reader.lag());
+println!("State: {:?}", ring.state());       // NearFull or Overflowed
+println!("Written: {}", ring.total_written()); // 2000
+println!("Dropped: {}", ring.dropped());       // 976
 ```
 
-## The Deeper Idea
+## API
 
-Ring buffers are the simplest possible streaming data structure. On the GPU, they're also the most practical — a kernel can write events to a ring buffer with a single atomic increment of the write pointer, no synchronization needed. The ternary overflow state adds metadata without adding latency.
+| Type | Description |
+|------|-------------|
+| `OxideRing` | Bounded ring buffer with ternary overflow tracking |
+| `Event` | id, kind, data, timestamp_us |
+| `BufferState` | `Normal (+1)`, `NearFull (0)`, `Overflowed (-1)` |
 
-This pattern appears everywhere in the SuperInstance ecosystem: `ternary-walsh` (streaming Walsh transforms), `oxide-journal` (WAL with similar overflow semantics), and `agent-transcription` (streaming event capture).
+Key methods: `write(kind, data, ts)`, `state()`, `dropped()`, `total_written()`, `set_warn_threshold(ratio)`.
 
-## Related Crates
+## Architecture Notes
 
-- `oxide-journal` — Write-ahead log (durable version of ring semantics)
-- `oxide-chunk` — Memory chunk management for ring buffer backing storage
-- `oxide-sandbox` — Safe execution environment that uses rings for event capture
-- `agent-transcription` — Agent event streaming using the same overflow model
+Oxide Ring provides event logging for GPU operations in the oxide-* stack. In γ + η = C, the ring enables γ (growth — capturing diagnostic events for analysis) while the ternary overflow state provides η (avoidance — NearFull signals consumers to drain before data loss; Overflowed tracks what was lost). Works with `oxide-barrier` for synchronized buffer access and `oxide-epoch` for safe event reclamation.
+
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU diagnostics architecture.
+
+## References
+
+1. Goodfellow, M. (2004). "Circular Buffers in Real-Time Systems." *Embedded Systems Programming*.
+2. Nichols, B. et al. (1996). *Pthreads Programming*. O'Reilly. (On bounded buffer synchronization)
+3. NVIDIA (2024). "CUPTI: CUDA Profiling Tools Interface." *NVIDIA Developer Documentation*.
+
+## License
+
+MIT
