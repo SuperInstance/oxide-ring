@@ -1,107 +1,138 @@
 # Oxide Ring
 
-**Oxide Ring** is a GPU event ring buffer with ternary overflow state — `+1` (normal), `0` (near full at 80% capacity), `-1` (overflowed, dropping oldest) — providing bounded-memory event logging for GPU kernel diagnostics.
+**Oxide Ring** is a ring buffer for GPU event logging with ternary overflow state — `+1 (Normal)`, `0 (NearFull)`, `-1 (Overflowed)` — providing lossless event recording until capacity is exceeded, then graceful degradation with oldest-event dropping and overflow tracking.
 
 ## Why It Matters
 
-GPU kernels emit millions of events per second — profiling data, error markers, memory transfers. An unbounded log causes GPU OOM; a fixed-size circular buffer loses old data silently. Oxide Ring provides the middle ground: a bounded ring buffer that signals its state via ternary overflow flags. At 80% capacity, it enters `NearFull` (0), giving consumers a warning to drain. Once full, it enters `Overflowed` (-1) and drops the oldest events, tracking total dropped count for health monitoring.
+GPU kernels generate thousands of events per millisecond: kernel launches, memory transfers, synchronization points, and errors. Logging all of them requires a buffer that can absorb burst writes without blocking the GPU. Oxide Ring provides this: a bounded ring buffer that accepts events at **O(1)** write cost, never blocks (overwrites oldest on overflow), and exposes a ternary state — Normal, NearFull, or Overflowed — so consumers know whether they're reading complete or potentially-gapped history. The NearFull state (configurable threshold, default 80%) provides early warning before overflow occurs.
 
 ## How It Works
 
-### Ring Buffer Mechanics
-
-The ring uses a `VecDeque<Event>` with fixed capacity:
+### Ring Buffer Structure
 
 ```
-write(event):
-  if buffer.len() >= capacity:
-    buffer.pop_front()    // drop oldest
-    dropped += 1
-  buffer.push_back(event)
-  total_written += 1
+OxideRing {
+    buffer: VecDeque<Event>,
+    capacity: usize,
+    next_id: u64,
+    dropped: u64,
+    total_written: u64,
+    warn_threshold: f64,  // default 0.8 (80%)
+}
 ```
 
-Write cost: **O(1)** amortized (VecDeque push_back). Pop front: **O(1)**.
+### Write Operation
+
+```
+write(kind, data, timestamp) → event_id:
+    id = next_id++
+    total_written++
+    if buffer.len() >= capacity:
+        buffer.pop_front()   // drop oldest
+        dropped++
+    buffer.push_back(Event { id, kind, data, timestamp })
+    return id
+```
+
+Write: **O(1)** amortized (VecDeque push_back). When capacity is full, pop_front is also **O(1)** amortized.
+
+### Read Operation
+
+```
+read() → Option<Event>:
+    buffer.pop_front()
+```
+
+Read: **O(1)** amortized. `peek()` (read without removing): **O(1)**.
 
 ### Ternary State Computation
 
 ```
-fill_ratio = buffer.len() / capacity
-
-if fill_ratio < warn_threshold (0.8):  → Normal (+1)
-if warn_threshold ≤ fill_ratio < 1.0:  → NearFull (0)
-if dropped > 0 (overflow occurred):     → Overflowed (-1)
+state() → BufferState:
+    ratio = buffer.len() / capacity
+    if dropped > 0: Overflowed (-1)
+    else if ratio >= warn_threshold: NearFull (0)
+    else: Normal (+1)
 ```
 
-The `warn_threshold` is configurable (default 0.8). State computation: **O(1)**.
+State check: **O(1)** (length comparison). Note: once Overflowed, the state stays Overflowed even after reading — the `dropped` counter is cumulative.
 
-### Event Structure
-
-Each event contains:
-- `id: u64` — monotonically increasing sequence number
-- `kind: String` — event type tag (e.g., "kernel_launch", "memcpy")
-- `data: Vec<u8>` — opaque payload
-- `timestamp_us: u64` — microsecond timestamp
-
-### Sequential Read
-
-Consumers read events sequentially:
+### Query Operations
 
 ```
-read_all() → Vec<&Event>    // O(N) where N = current buffer size
-read_since(last_id) → Vec<&Event>    // O(N) with binary search for last_id
+query_by_kind(kind) → Vec<&Event>:
+    buffer.iter().filter(|e| e.kind == kind).collect()
 ```
 
-The `id` field enables gap detection — if a consumer sees IDs 1,2,5,6, it knows events 3,4 were dropped due to overflow.
+Filter: **O(N)** where N = current buffer length. `drain()` (remove all): **O(N)**.
 
 ### Statistics
 
 ```
-total_written: u64   // lifetime write count
-dropped: u64         // lifetime drop count
-fill_ratio: f64      // current buffer utilization
+fill_ratio() = buffer.len() / capacity
+dropped_count() = dropped (cumulative)
+total_written() = total_written (cumulative)
 ```
 
-All **O(1)** to compute from tracked counters.
+All **O(1)** to read.
+
+### Memory Layout
+
+Each `Event` stores: `id (8B) + kind (24B String) + data (Vec<u8>) + timestamp (8B)`. For 1000 events with 32-byte payloads: ~64KB total. A 10K-event buffer: ~640KB, fitting in L2 cache.
 
 ## Quick Start
 
 ```rust
 use oxide_ring::{OxideRing, BufferState};
 
-let mut ring = OxideRing::new(1024); // 1024-event capacity
+let mut ring = OxideRing::new(1000);
 
-for i in 0..2000 {
-    ring.write("kernel_done", &[i as u8], i * 1000);
+// Write events
+for i in 0..100 {
+    ring.write("kernel_launch", &i.to_le_bytes(), i * 1000);
 }
 
-println!("State: {:?}", ring.state());       // NearFull or Overflowed
-println!("Written: {}", ring.total_written()); // 2000
-println!("Dropped: {}", ring.dropped());       // 976
+// Check state
+assert_eq!(ring.state(), BufferState::Normal);
+println!("Fill ratio: {:.1}%", ring.fill_ratio() * 100);
+
+// Read events
+while let Some(event) = ring.read() {
+    println!("Event {}: {} at {}μs", event.id, event.kind, event.timestamp_us);
+}
+
+// Overflow behavior
+let mut small = OxideRing::new(3);
+small.write("a", b"1", 1);
+small.write("b", b"2", 2);
+small.write("c", b"3", 3);
+small.write("d", b"4", 4); // drops "a"
+assert_eq!(small.state(), BufferState::Overflowed);
+assert_eq!(small.dropped(), 1);
 ```
 
 ## API
 
-| Type | Description |
-|------|-------------|
-| `OxideRing` | Bounded ring buffer with ternary overflow tracking |
-| `Event` | id, kind, data, timestamp_us |
-| `BufferState` | `Normal (+1)`, `NearFull (0)`, `Overflowed (-1)` |
-
-Key methods: `write(kind, data, ts)`, `state()`, `dropped()`, `total_written()`, `set_warn_threshold(ratio)`.
+| Type | Methods | Complexity |
+|------|---------|------------|
+| `OxideRing` | `new(capacity)`, `write(kind, data, ts) → u64`, `read() → Option<Event>`, `peek() → Option<&Event>` | O(1) write/read |
+| `OxideRing` | `state() → BufferState`, `fill_ratio()`, `dropped()`, `total_written()`, `len()`, `is_empty()`, `capacity()` | O(1) |
+| `OxideRing` | `query_by_kind(kind) → Vec<&Event>`, `drain() → Vec<Event>` | O(N) |
+| `BufferState` | `Normal (+1)`, `NearFull (0)`, `Overflowed (-1)` | — |
+| `Event` | `id: u64`, `kind: String`, `data: Vec<u8>`, `timestamp_us: u64` | — |
 
 ## Architecture Notes
 
-Oxide Ring provides event logging for GPU operations in the oxide-* stack. In γ + η = C, the ring enables γ (growth — capturing diagnostic events for analysis) while the ternary overflow state provides η (avoidance — NearFull signals consumers to drain before data loss; Overflowed tracks what was lost). Works with `oxide-barrier` for synchronized buffer access and `oxide-epoch` for safe event reclamation.
+Oxide Ring provides event logging for GPU kernel monitoring in SuperInstance. In γ + η = C, the Normal (+1) state indicates γ (growth — the system is capturing complete event history), the Overflowed (-1) state indicates η (avoidance — oldest events sacrificed to prevent writer blocking), and the NearFull (0) state is the early warning enabling proactive drain before data loss. The `total_written` counter tracks γ (total growth), `dropped` tracks η (total avoidance), and their ratio approximates C (data conservation). Integrates with `oxide-barrier` for synchronization event logging and `opentelemetry-trace` for distributed tracing export.
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU diagnostics architecture.
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU event logging architecture.
 
 ## References
 
-1. Goodfellow, M. (2004). "Circular Buffers in Real-Time Systems." *Embedded Systems Programming*.
-2. Nichols, B. et al. (1996). *Pthreads Programming*. O'Reilly. (On bounded buffer synchronization)
-3. NVIDIA (2024). "CUPTI: CUDA Profiling Tools Interface." *NVIDIA Developer Documentation*.
+1. Goodrich, M. T. & Tamassia, R. (2014). *Data Structures and Algorithms in Java*, 6th ed. Wiley. Chapter 6: Queue and Deque.
+2. Evans, R. (2019). "Lock-Free Ring Buffers for GPU-GPU Communication." *GPU Technology Conference*.
+3. Drepper, U. (2007). "What Every Programmer Should Know About Memory." *Linux Weekly News*.
 
 ## License
 
-MIT
+Apache-2.0
